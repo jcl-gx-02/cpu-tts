@@ -3,7 +3,7 @@ version: "3.3"
 services:
   sherpa-tts:
     container_name: sherpa-tts
-    image: dockhub.ghtchina.com:6060/model-images/tts-sherpa-x86-image:R01.00.01
+    image: xxxxxx/tts-sherpa-x86-image:R01.00.01 # 实际镜像
 
     restart: unless-stopped
     network_mode: host
