@@ -1,0 +1,59 @@
+version: "3.3"
+
+services:
+  sherpa-tts:
+    container_name: sherpa-tts
+    image: dockhub.ghtchina.com:6060/model-images/tts-sherpa-x86-image:R01.00.01
+
+    restart: unless-stopped
+    network_mode: host
+
+    ports:
+      - "8000:8000"
+
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      MAX_CONCURRENT_WORKERS: "10"
+      ONNX_NUM_THREADS: "10"
+      # 默认音色（female=piper 中文女声；传 voice=auto 启用中英双模型路由）
+      DEFAULT_VOICE: "female"
+      # 中英语种路由：短于该值的英文片段并入中文音色；纯大写缩写始终走英文音色
+      AUTO_MIN_SPAN_CHARS: "4"
+      # 电力领域文本规范化（HTML 实体、"I段"、数值单位、小数读法）
+      DOMAIN_NORMALIZE: "true"
+      # 拼接质量：每块字符上限 / 句末·逗号·句中停顿(ms) / 裁剪边距 / 边缘淡化
+      CHUNK_MAX_CHARS: "80"
+      SENTENCE_GAP_MS: "120"
+      CLAUSE_GAP_MS: "50"
+      DEFAULT_GAP_MS: "20"
+      SILENCE_KEEP_MS: "25"
+      FADE_MS: "8"
+      TRIM_SILENCE: "true"
+
+    volumes:
+      - ./model_app:/app
+      - ./model_weight:/models:ro
+      - ./logs:/logs
+
+        #mem_limit: 16g
+    shm_size: "1g"
+
+    command:
+      - python
+      - /app/vits_tts_server.py
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      #start_period: 60s

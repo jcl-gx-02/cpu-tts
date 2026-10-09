@@ -1,0 +1,1825 @@
+# #!/usr/bin/env python3
+# # -*- coding: utf-8 -*-
+# # 版本1，目前RTF可到达要求2026年9月1日 BY Chenglong
+# import time
+# import re
+# import io
+# import base64
+# import asyncio
+# import threading
+# from concurrent.futures import ThreadPoolExecutor
+# from contextlib import asynccontextmanager
+
+# import numpy as np
+# import soundfile as sf
+# import sherpa_onnx
+# from fastapi import FastAPI, HTTPException
+# from fastapi.responses import Response, StreamingResponse
+# from pydantic import BaseModel, Field
+# import uvicorn
+
+# # ==========================================
+# # 1. 服务配置区 (可根据服务器 CPU 核心数调整)
+# # ==========================================
+# # 控制同时并发处理的请求数
+# MAX_CONCURRENT_WORKERS = 4 
+# # 每个 VITS 实例内部使用的 ONNX 线程数
+# ONNX_NUM_THREADS = 4 
+
+# # 模型路径配置
+# MODEL_DIR = "./vits-piper-zh_CN-chaowen-medium"
+
+# # ==========================================
+# # 2. 并发引擎与线程池管理 (Thread-Local)
+# # ==========================================
+# thread_local = threading.local()
+# executor = None
+
+# def init_worker():
+#     """线程池初始化函数：为每个工作线程创建一个独立的 VITS TTS 实例，避免并发锁竞争"""
+#     try:
+#         tts_config = sherpa_onnx.OfflineTtsConfig(
+#             model=sherpa_onnx.OfflineTtsModelConfig(
+#                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+#                     model=f"{MODEL_DIR}/zh_CN-chaowen-medium.onnx",
+#                     tokens=f"{MODEL_DIR}/tokens.txt",
+#                     lexicon=f"{MODEL_DIR}/lexicon.txt",
+#                 ),
+#                 num_threads=ONNX_NUM_THREADS,
+#                 debug=False,
+#             ),
+#             rule_fsts=f"{MODEL_DIR}/phone.fst,{MODEL_DIR}/date.fst,{MODEL_DIR}/number.fst",
+#         )
+#         if not tts_config.validate():
+#             raise ValueError("VITS TTS Config validation failed.")
+        
+#         # 绑定到当前线程
+#         thread_local.tts = sherpa_onnx.OfflineTts(tts_config)
+#         print(f"[Worker Init] VITS TTS engine initialized in thread: {threading.get_ident()}")
+#     except Exception as e:
+#         print(f"[Worker Init Error] Failed to init VITS engine: {e}")
+
+# # ==========================================
+# # 3. API 数据模型定义
+# # ==========================================
+# class TTSRequest(BaseModel):
+#     text: str = Field(..., description="需要合成的目标文本")
+#     sid: int = Field(default=0, description="说话人 ID (Speaker ID)")
+#     speed: float = Field(default=1.0, description="语速调节系数")
+
+# # ==========================================
+# # 4. FastAPI 应用生命周期管理
+# # ==========================================
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     global executor
+#     print(f"Starting ThreadPoolExecutor with {MAX_CONCURRENT_WORKERS} workers...")
+#     executor = ThreadPoolExecutor(
+#         max_workers=MAX_CONCURRENT_WORKERS, 
+#         initializer=init_worker
+#     )
+#     yield
+#     print("Shutting down ThreadPoolExecutor...")
+#     executor.shutdown(wait=True)
+
+# app = FastAPI(title="VITS TTS High-Performance API", lifespan=lifespan)
+
+# # ==========================================
+# # 5. 核心处理逻辑 (文本切分与推理任务)
+# # ==========================================
+# def split_text_by_punctuation(text: str) -> list:
+#     """按中英文常用标点符号切分文本，保留标点，确保短句均匀"""
+#     pattern = r'([，。！？；,\.\!\?\;]+)'
+#     chunks = re.split(pattern, text)
+    
+#     sentences = []
+#     for i in range(0, len(chunks) - 1, 2):
+#         sentence = chunks[i].strip() + chunks[i+1].strip()
+#         if sentence:
+#             sentences.append(sentence)
+            
+#     if len(chunks) % 2 != 0 and chunks[-1].strip():
+#         sentences.append(chunks[-1].strip())
+        
+#     return sentences
+
+# def _generate_chunk_sync(text: str, sid: int, speed: float):
+#     """在工作线程中执行 VITS 推理"""
+#     if not hasattr(thread_local, 'tts'):
+#         raise RuntimeError("VITS TTS engine not initialized in this thread!")
+    
+#     tts_engine = thread_local.tts
+#     audio = tts_engine.generate(text, sid=sid, speed=speed)
+    
+#     if len(audio.samples) == 0:
+#         return None, 0
+        
+#     return np.array(audio.samples, dtype=np.float32), audio.sample_rate
+
+# # ==========================================
+# # 6. 完整文件合成接口
+# # ==========================================
+# @app.post("/api/tts")
+# async def generate_tts(request: TTSRequest):
+#     """将文本切分后并发合成，最终按顺序拼接成一个完整的 WAV 文件返回"""
+#     sentences = split_text_by_punctuation(request.text)
+#     if not sentences:
+#         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+#     start_time = time.time()
+#     loop = asyncio.get_running_loop()
+    
+#     all_samples = []
+#     out_sample_rate = 22050 # VITS default sample rate
+    
+#     # 【优化点】：不再使用 for 循环串行等待，而是将所有分句打包成任务，并发提交给线程池！
+#     tasks = [
+#         loop.run_in_executor(
+#             executor,
+#             _generate_chunk_sync,
+#             sentence,
+#             request.sid,
+#             request.speed
+#         )
+#         for sentence in sentences
+#     ]
+    
+#     # asyncio.gather 会并发执行所有任务，并且保证返回的 results 顺序与输入的 tasks 顺序完全一致！
+#     results = await asyncio.gather(*tasks)
+    
+#     # 按顺序收集并发生成的结果
+#     for samples, sr in results:
+#         if samples is not None:
+#             all_samples.append(samples)
+#             out_sample_rate = sr
+
+#     if not all_samples:
+#         raise HTTPException(status_code=500, detail="Failed to generate any audio.")
+
+#     final_audio = np.concatenate(all_samples)
+    
+#     elapsed = time.time() - start_time
+#     duration = len(final_audio) / out_sample_rate
+#     print(f"[Complete TTS] Chunks: {len(sentences)} (Parallel) | RTF: {elapsed:.3f}/{duration:.3f} = {elapsed/duration:.3f}")
+
+#     buffer = io.BytesIO()
+#     sf.write(buffer, final_audio, samplerate=out_sample_rate, subtype="PCM_16", format="WAV")
+#     buffer.seek(0)
+    
+#     return Response(content=buffer.read(), media_type="audio/wav")
+
+# # ==========================================
+# # 7. 分段 WAV 推送接口 (SSE + JSON + Base64)
+# # ==========================================
+# @app.post("/api/tts_sse")
+# async def generate_tts_sse(request: TTSRequest):
+#     """
+#     分段推送接口 (Server-Sent Events): 
+#     按标点切分，每生成一句话，立刻包装成独立的 WAV 文件并用 Base64 编码，
+#     以 SSE 事件流推送给前端，实现极低首字节延迟。
+#     """
+#     sentences = split_text_by_punctuation(request.text)
+#     if not sentences:
+#         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+#     async def sse_generator():
+#         import json
+#         loop = asyncio.get_running_loop()
+#         for i, sentence in enumerate(sentences):
+#             start = time.time()
+#             samples, sr = await loop.run_in_executor(
+#                 executor,
+#                 _generate_chunk_sync,
+#                 sentence,
+#                 request.sid,
+#                 request.speed
+#             )
+            
+#             if samples is not None and len(samples) > 0:
+#                 buffer = io.BytesIO()
+#                 sf.write(buffer, samples, samplerate=sr, subtype="PCM_16", format="WAV")
+#                 buffer.seek(0)
+                
+#                 wav_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+                
+#                 chunk_duration = len(samples) / sr
+#                 chunk_elapsed = time.time() - start
+#                 print(f"[SSE Chunk {i}] Synthesized: '{sentence[:10]}...' | RTF: {chunk_elapsed/chunk_duration:.3f}")
+                
+#                 payload = {
+#                     "chunk_index": i,
+#                     "text": sentence,
+#                     "audio_base64": wav_base64,
+#                     "is_final": i == (len(sentences) - 1)
+#                 }
+#                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+#     return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+# # ==========================================
+# # 8. 启动脚本
+# # ==========================================
+# if __name__ == "__main__":
+#     uvicorn.run(
+#         "vits_tts_server:app", 
+#         host="0.0.0.0", 
+#         port=8000, 
+#         workers=1,
+#         log_level="info"
+#     )
+
+# # =======================版本2：2026年9月2日后使用，RTF可到达要求 BY Chenglong
+# #!/usr/bin/env python3
+# # -*- coding: utf-8 -*-
+
+# import time
+# import re
+# import io
+# import base64
+# import asyncio
+# import threading
+# from concurrent.futures import ThreadPoolExecutor
+# from contextlib import asynccontextmanager
+
+# import numpy as np
+# import soundfile as sf
+# import sherpa_onnx
+# from fastapi import FastAPI, HTTPException
+# from fastapi.responses import Response, StreamingResponse
+# from pydantic import BaseModel, Field
+# import uvicorn
+
+# # ==========================================
+# # 1. 服务配置区 (可根据服务器 CPU 核心数调整)
+# # ==========================================
+# # 控制同时并发处理的请求数
+# MAX_CONCURRENT_WORKERS = 4 
+# # 每个 VITS 实例内部使用的 ONNX 线程数
+# ONNX_NUM_THREADS = 4 
+
+# # # @@@@@@@@@@@男性@@@@@@@@@@@@@模型路径配置=======male
+# # MODEL_DIR = "./vits-piper-zh_CN-chaowen-medium"
+
+# # # ==========================================
+# # # 2. 并发引擎与线程池管理 (Thread-Local)
+# # # ==========================================
+# # thread_local = threading.local()
+# # executor = None
+
+# # def init_worker():
+# #     """线程池初始化函数：为每个工作线程创建一个独立的 VITS TTS 实例，避免并发锁竞争"""
+# #     try:
+# #         tts_config = sherpa_onnx.OfflineTtsConfig(
+# #             model=sherpa_onnx.OfflineTtsModelConfig(
+# #                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+# #                     model=f"{MODEL_DIR}/zh_CN-chaowen-medium.onnx",
+# #                     tokens=f"{MODEL_DIR}/tokens.txt",
+# #                     lexicon=f"{MODEL_DIR}/lexicon.txt",
+# #                 ),
+# #                 num_threads=ONNX_NUM_THREADS,
+# #                 debug=False,
+# #             ),
+# #             rule_fsts=f"{MODEL_DIR}/phone.fst,{MODEL_DIR}/date.fst,{MODEL_DIR}/number.fst",
+# #         )
+# #         if not tts_config.validate():
+# #             raise ValueError("VITS TTS Config validation failed.")
+        
+# #         # 绑定到当前线程
+# #         thread_local.tts = sherpa_onnx.OfflineTts(tts_config)
+# #         print(f"[Worker Init] VITS TTS engine initialized in thread: {threading.get_ident()}")
+# #     except Exception as e:
+# #         print(f"[Worker Init Error] Failed to init VITS engine: {e}")
+# # # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+# # @@@@@@@@@@@女性@@@@@@@@@@@@@模型路径配置=======male
+# MODEL_DIR = "./vits-piper-zh_CN-xiao_ya-medium"
+
+# # ==========================================
+# # 2. 并发引擎与线程池管理 (Thread-Local)
+# # ==========================================
+# thread_local = threading.local()
+# executor = None
+
+# def init_worker():
+#     """线程池初始化函数：为每个工作线程创建一个独立的 VITS TTS 实例，避免并发锁竞争"""
+#     try:
+#         tts_config = sherpa_onnx.OfflineTtsConfig(
+#             model=sherpa_onnx.OfflineTtsModelConfig(
+#                 vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+#                     model=f"{MODEL_DIR}/zh_CN-xiao_ya-medium.onnx",
+#                     tokens=f"{MODEL_DIR}/tokens.txt",
+#                     lexicon=f"{MODEL_DIR}/lexicon.txt",
+#                 ),
+#                 num_threads=ONNX_NUM_THREADS,
+#                 debug=False,
+#             ),
+#             rule_fsts=f"{MODEL_DIR}/phone.fst,{MODEL_DIR}/date.fst,{MODEL_DIR}/number.fst",
+#         )
+#         if not tts_config.validate():
+#             raise ValueError("VITS TTS Config validation failed.")
+        
+#         # 绑定到当前线程
+#         thread_local.tts = sherpa_onnx.OfflineTts(tts_config)
+#         print(f"[Worker Init] VITS TTS engine initialized in thread: {threading.get_ident()}")
+#     except Exception as e:
+#         print(f"[Worker Init Error] Failed to init VITS engine: {e}")
+# # @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+
+
+# # ==========================================
+# # 3. API 数据模型定义
+# # ==========================================
+# class TTSRequest(BaseModel):
+#     text: str = Field(..., description="需要合成的目标文本")
+#     sid: int = Field(default=0, description="说话人 ID (Speaker ID)")
+#     speed: float = Field(default=1.0, description="语速调节系数")
+
+# # ==========================================
+# # 4. FastAPI 应用生命周期管理
+# # ==========================================
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     global executor
+#     print(f"Starting ThreadPoolExecutor with {MAX_CONCURRENT_WORKERS} workers...")
+#     executor = ThreadPoolExecutor(
+#         max_workers=MAX_CONCURRENT_WORKERS, 
+#         initializer=init_worker
+#     )
+    
+#     # ----------------------------------------------------
+#     # 新增：模型预热 (Model Warm-up)
+#     # ----------------------------------------------------
+#     print(f"开始预热模型... 提交 {MAX_CONCURRENT_WORKERS} 个并发任务...")
+#     start_warmup = time.time()
+    
+#     # 获取当前的 asyncio 事件循环
+#     loop = asyncio.get_running_loop()
+    
+#     # 构造一批简单的短文本任务，强制唤醒所有的 Worker
+#     warmup_text = "系统引擎预热完毕。"
+#     tasks = [
+#         loop.run_in_executor(
+#             executor,
+#             _generate_chunk_sync,
+#             warmup_text,
+#             0,    # sid
+#             1.0   # speed
+#         )
+#         for _ in range(MAX_CONCURRENT_WORKERS)
+#     ]
+    
+#     # 并发执行，这会将 numpy 数组生成在内存中，完成后立刻被 Python 垃圾回收，不会产生本地文件
+#     await asyncio.gather(*tasks)
+    
+#     print(f"模型预热完成！耗时: {time.time() - start_warmup:.3f} 秒. 服务已完全准备就绪。")
+#     # ----------------------------------------------------
+
+#     yield
+    
+#     print("Shutting down ThreadPoolExecutor...")
+#     executor.shutdown(wait=True)
+
+# app = FastAPI(title="VITS TTS High-Performance API", lifespan=lifespan)
+
+# # ==========================================
+# # 5. 核心处理逻辑 (文本切分与推理任务)
+# # ==========================================
+# def split_text_by_punctuation(text: str) -> list:
+#     """按中英文常用标点符号切分文本，保留标点，确保短句均匀"""
+#     pattern = r'([，。！？；,\.\!\?\;]+)'
+#     chunks = re.split(pattern, text)
+    
+#     sentences = []
+#     for i in range(0, len(chunks) - 1, 2):
+#         sentence = chunks[i].strip() + chunks[i+1].strip()
+#         if sentence:
+#             sentences.append(sentence)
+            
+#     if len(chunks) % 2 != 0 and chunks[-1].strip():
+#         sentences.append(chunks[-1].strip())
+        
+#     return sentences
+
+# def _generate_chunk_sync(text: str, sid: int, speed: float):
+#     """在工作线程中执行 VITS 推理"""
+#     if not hasattr(thread_local, 'tts'):
+#         raise RuntimeError("VITS TTS engine not initialized in this thread!")
+    
+#     tts_engine = thread_local.tts
+#     audio = tts_engine.generate(text, sid=sid, speed=speed)
+    
+#     if len(audio.samples) == 0:
+#         return None, 0
+        
+#     return np.array(audio.samples, dtype=np.float32), audio.sample_rate
+
+# # ==========================================
+# # 6. 完整文件合成接口
+# # ==========================================
+# @app.post("/api/tts")
+# async def generate_tts(request: TTSRequest):
+#     """将文本切分后并发合成，最终按顺序拼接成一个完整的 WAV 文件返回"""
+#     sentences = split_text_by_punctuation(request.text)
+#     if not sentences:
+#         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+#     start_time = time.time()
+#     loop = asyncio.get_running_loop()
+    
+#     all_samples = []
+#     out_sample_rate = 22050 # VITS default sample rate
+    
+#     # 【优化点】：不再使用 for 循环串行等待，而是将所有分句打包成任务，并发提交给线程池！
+#     tasks = [
+#         loop.run_in_executor(
+#             executor,
+#             _generate_chunk_sync,
+#             sentence,
+#             request.sid,
+#             request.speed
+#         )
+#         for sentence in sentences
+#     ]
+    
+#     # asyncio.gather 会并发执行所有任务，并且保证返回的 results 顺序与输入的 tasks 顺序完全一致！
+#     results = await asyncio.gather(*tasks)
+    
+#     # 按顺序收集并发生成的结果
+#     for samples, sr in results:
+#         if samples is not None:
+#             all_samples.append(samples)
+#             out_sample_rate = sr
+
+#     if not all_samples:
+#         raise HTTPException(status_code=500, detail="Failed to generate any audio.")
+
+#     final_audio = np.concatenate(all_samples)
+    
+#     elapsed = time.time() - start_time
+#     duration = len(final_audio) / out_sample_rate
+#     print(f"[Complete TTS] Chunks: {len(sentences)} (Parallel) | RTF: {elapsed:.3f}/{duration:.3f} = {elapsed/duration:.3f}")
+
+#     buffer = io.BytesIO()
+#     sf.write(buffer, final_audio, samplerate=out_sample_rate, subtype="PCM_16", format="WAV")
+#     buffer.seek(0)
+    
+#     return Response(content=buffer.read(), media_type="audio/wav")
+
+# # ==========================================
+# # 7. 分段 WAV 推送接口 (SSE + JSON + Base64)
+# # ==========================================
+# @app.post("/api/tts_sse")
+# async def generate_tts_sse(request: TTSRequest):
+#     """
+#     分段推送接口 (Server-Sent Events): 
+#     按标点切分，每生成一句话，立刻包装成独立的 WAV 文件并用 Base64 编码，
+#     以 SSE 事件流推送给前端，实现极低首字节延迟。
+#     """
+#     sentences = split_text_by_punctuation(request.text)
+#     if not sentences:
+#         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+#     async def sse_generator():
+#         import json
+#         loop = asyncio.get_running_loop()
+#         for i, sentence in enumerate(sentences):
+#             start = time.time()
+#             samples, sr = await loop.run_in_executor(
+#                 executor,
+#                 _generate_chunk_sync,
+#                 sentence,
+#                 request.sid,
+#                 request.speed
+#             )
+            
+#             if samples is not None and len(samples) > 0:
+#                 buffer = io.BytesIO()
+#                 sf.write(buffer, samples, samplerate=sr, subtype="PCM_16", format="WAV")
+#                 buffer.seek(0)
+                
+#                 wav_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+                
+#                 chunk_duration = len(samples) / sr
+#                 chunk_elapsed = time.time() - start
+#                 print(f"[SSE Chunk {i}] Synthesized: '{sentence[:10]}...' | RTF: {chunk_elapsed/chunk_duration:.3f}")
+                
+#                 payload = {
+#                     "chunk_index": i,
+#                     "text": sentence,
+#                     "audio_base64": wav_base64,
+#                     "is_final": i == (len(sentences) - 1)
+#                 }
+#                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+#     return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+# # ==========================================
+# # 8. 启动脚本
+# # ==========================================
+# if __name__ == "__main__":
+#     uvicorn.run(
+#         "vits_tts_server:app", 
+#         host="0.0.0.0", 
+#         port=8000, 
+#         workers=1,
+#         log_level="info"
+#     )
+
+
+# ===================版本3：同时加载2个权重，支持男女音色的切换！！！模型多实例，不共享权重内存@@2026年9月2日后使用，RTF可到达要求 BY Chenglong
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+# import time
+# import re
+# import io
+# import base64
+# import asyncio
+# import threading
+# from concurrent.futures import ThreadPoolExecutor
+# from contextlib import asynccontextmanager
+
+# import numpy as np
+# import soundfile as sf
+# import sherpa_onnx
+# from fastapi import FastAPI, HTTPException
+# from fastapi.responses import Response, StreamingResponse
+# from pydantic import BaseModel, Field
+# import uvicorn
+
+# # ==========================================
+# # 1. 服务与多模型配置区
+# # ==========================================
+# MAX_CONCURRENT_WORKERS = 10 
+# ONNX_NUM_THREADS = 4 
+
+# # 定义支持的多音色模型字典 (可以随时扩展更多音色)
+# VOICE_MODELS = {
+#     "male": {
+#         "dir": "./vits-piper-zh_CN-chaowen-medium",
+#         "onnx_name": "zh_CN-chaowen-medium.onnx"
+#     },
+#     "female": {
+#         "dir": "./vits-piper-zh_CN-xiao_ya-medium",
+#         "onnx_name": "zh_CN-xiao_ya-medium.onnx"
+#         ### int8版本
+#         # "dir": "./vits-piper-zh_CN-xiao_ya-medium-int8",
+#         # "onnx_name": "zh_CN-xiao_ya-medium.onnx"
+#     }
+# }
+
+# # 默认音色
+# DEFAULT_VOICE = "female"
+
+# # ==========================================
+# # 2. 并发引擎与线程池管理 (Thread-Local)
+# # ==========================================
+# thread_local = threading.local()
+# executor = None
+
+# def init_worker():
+#     """线程池初始化函数：为每个工作线程预加载所有支持的音色模型"""
+#     thread_local.tts_engines = {}
+    
+#     for voice_id, config in VOICE_MODELS.items():
+#         try:
+#             model_dir = config["dir"]
+#             onnx_name = config["onnx_name"]
+            
+#             tts_config = sherpa_onnx.OfflineTtsConfig(
+#                 model=sherpa_onnx.OfflineTtsModelConfig(
+#                     vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+#                         model=f"{model_dir}/{onnx_name}",
+#                         tokens=f"{model_dir}/tokens.txt",
+#                         lexicon=f"{model_dir}/lexicon.txt",
+#                     ),
+#                     num_threads=ONNX_NUM_THREADS,
+#                     debug=False,
+#                 ),
+#                 rule_fsts=f"{model_dir}/phone.fst,{model_dir}/date.fst,{model_dir}/number.fst",
+#             )
+#             if not tts_config.validate():
+#                 raise ValueError(f"VITS TTS Config validation failed for {voice_id}.")
+            
+#             # 存入当前线程的引擎字典中
+#             thread_local.tts_engines[voice_id] = sherpa_onnx.OfflineTts(tts_config)
+#             print(f"[Worker Init] Loaded voice '{voice_id}' in thread: {threading.get_ident()}")
+#         except Exception as e:
+#             print(f"[Worker Init Error] Failed to init voice '{voice_id}': {e}")
+
+# # ==========================================
+# # 3. API 数据模型定义
+# # ==========================================
+# class TTSRequest(BaseModel):
+#     text: str = Field(..., description="需要合成的目标文本")
+#     voice: str = Field(default=DEFAULT_VOICE, description="音色选择：'male' 或 'female'")
+#     sid: int = Field(default=0, description="说话人 ID (Speaker ID)")
+#     speed: float = Field(default=1.0, description="语速调节系数")
+
+# # ==========================================
+# # 4. FastAPI 应用生命周期管理
+# # ==========================================
+# @asynccontextmanager
+# async def lifespan(app: FastAPI):
+#     global executor
+#     print(f"Starting ThreadPoolExecutor with {MAX_CONCURRENT_WORKERS} workers...")
+#     executor = ThreadPoolExecutor(
+#         max_workers=MAX_CONCURRENT_WORKERS, 
+#         initializer=init_worker
+#     )
+    
+#     # --- 模型预热 (Model Warm-up) ---
+#     print(f"开始预热模型... 提交 {MAX_CONCURRENT_WORKERS} 个并发任务...")
+#     start_warmup = time.time()
+#     loop = asyncio.get_running_loop()
+    
+#     warmup_tasks = []
+#     warmup_text = "引擎预热。"
+    
+#     # 为每一个加载的音色都执行预热
+#     for _ in range(MAX_CONCURRENT_WORKERS):
+#         for voice_id in VOICE_MODELS.keys():
+#             warmup_tasks.append(
+#                 loop.run_in_executor(
+#                     executor, _generate_chunk_sync, warmup_text, voice_id, 0, 1.0
+#                 )
+#             )
+    
+#     await asyncio.gather(*warmup_tasks)
+#     print(f"双音色模型预热完成！耗时: {time.time() - start_warmup:.3f} 秒. 服务完全就绪。")
+
+#     yield
+    
+#     print("Shutting down ThreadPoolExecutor...")
+#     executor.shutdown(wait=True)
+
+# app = FastAPI(title="VITS TTS Multi-Voice API", lifespan=lifespan)
+
+# # ==========================================
+# # 5. 核心处理逻辑 (文本切分与推理任务)
+# # ==========================================
+# def split_text_by_punctuation(text: str) -> list:
+#     """按中英文常用标点符号切分文本，保留标点，确保短句均匀"""
+#     pattern = r'([，。！？；,\.\!\?\;]+)'
+#     chunks = re.split(pattern, text)
+#     sentences = []
+#     for i in range(0, len(chunks) - 1, 2):
+#         sentence = chunks[i].strip() + chunks[i+1].strip()
+#         if sentence:
+#             sentences.append(sentence)
+#     if len(chunks) % 2 != 0 and chunks[-1].strip():
+#         sentences.append(chunks[-1].strip())
+#     return sentences
+
+# def _generate_chunk_sync(text: str, voice: str, sid: int, speed: float):
+#     """在工作线程中执行指定音色的 VITS 推理"""
+#     if not hasattr(thread_local, 'tts_engines'):
+#         raise RuntimeError("TTS engines not initialized in this thread!")
+    
+#     if voice not in thread_local.tts_engines:
+#         raise ValueError(f"Voice '{voice}' is not supported or not loaded.")
+        
+#     tts_engine = thread_local.tts_engines[voice]
+#     audio = tts_engine.generate(text, sid=sid, speed=speed)
+    
+#     if len(audio.samples) == 0:
+#         return None, 0
+        
+#     return np.array(audio.samples, dtype=np.float32), audio.sample_rate
+
+# # ==========================================
+# # 6. 完整文件合成接口
+# # ==========================================
+# @app.post("/api/tts")
+# async def generate_tts(request: TTSRequest):
+#     if request.voice not in VOICE_MODELS:
+#         raise HTTPException(status_code=400, detail=f"Invalid voice. Supported: {list(VOICE_MODELS.keys())}")
+        
+#     sentences = split_text_by_punctuation(request.text)
+#     if not sentences:
+#         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+#     start_time = time.time()
+#     loop = asyncio.get_running_loop()
+#     all_samples = []
+#     out_sample_rate = 22050 
+    
+#     # 并发提交任务，透传用户选择的 voice 参数
+#     tasks = [
+#         loop.run_in_executor(
+#             executor,
+#             _generate_chunk_sync,
+#             sentence,
+#             request.voice, # 传入音色
+#             request.sid,
+#             request.speed
+#         )
+#         for sentence in sentences
+#     ]
+    
+#     results = await asyncio.gather(*tasks)
+    
+#     for samples, sr in results:
+#         if samples is not None:
+#             all_samples.append(samples)
+#             out_sample_rate = sr
+
+#     if not all_samples:
+#         raise HTTPException(status_code=500, detail="Failed to generate any audio.")
+
+#     final_audio = np.concatenate(all_samples)
+#     elapsed = time.time() - start_time
+#     duration = len(final_audio) / out_sample_rate
+#     print(f"[Complete TTS | {request.voice}] Chunks: {len(sentences)} | RTF: {elapsed/duration:.3f}")
+
+#     buffer = io.BytesIO()
+#     sf.write(buffer, final_audio, samplerate=out_sample_rate, subtype="PCM_16", format="WAV")
+#     buffer.seek(0)
+    
+#     return Response(content=buffer.read(), media_type="audio/wav")
+
+# # ==========================================
+# # 7. 分段 WAV 推送接口 (SSE + JSON + Base64)
+# # ==========================================
+# @app.post("/api/tts_sse")
+# async def generate_tts_sse(request: TTSRequest):
+#     if request.voice not in VOICE_MODELS:
+#         raise HTTPException(status_code=400, detail=f"Invalid voice. Supported: {list(VOICE_MODELS.keys())}")
+
+#     sentences = split_text_by_punctuation(request.text)
+#     if not sentences:
+#         raise HTTPException(status_code=400, detail="Text cannot be empty.")
+
+#     async def sse_generator():
+#         import json
+#         loop = asyncio.get_running_loop()
+#         for i, sentence in enumerate(sentences):
+#             start = time.time()
+#             samples, sr = await loop.run_in_executor(
+#                 executor,
+#                 _generate_chunk_sync,
+#                 sentence,
+#                 request.voice, # 传入音色
+#                 request.sid,
+#                 request.speed
+#             )
+            
+#             if samples is not None and len(samples) > 0:
+#                 buffer = io.BytesIO()
+#                 sf.write(buffer, samples, samplerate=sr, subtype="PCM_16", format="WAV")
+#                 buffer.seek(0)
+                
+#                 wav_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+#                 print(f"[SSE Chunk {i} | {request.voice}] Synthesized: '{sentence[:10]}...'")
+                
+#                 payload = {
+#                     "chunk_index": i,
+#                     "text": sentence,
+#                     "voice_used": request.voice,
+#                     "audio_base64": wav_base64,
+#                     "is_final": i == (len(sentences) - 1)
+#                 }
+#                 yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+#     return StreamingResponse(sse_generator(), media_type="text/event-stream")
+
+# # ==========================================
+# # 8. 启动脚本
+# # ==========================================
+# if __name__ == "__main__":
+#     uvicorn.run(
+#         "vits_tts_server:app", 
+#         host="0.0.0.0", 
+#         port=8000, 
+#         workers=1,
+#         log_level="info"
+#     )
+
+
+
+
+## 版本4，多实例共享权重内存！！！
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import time
+import re
+import io
+import os
+import base64
+import asyncio
+import threading
+import json
+
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
+
+import numpy as np
+import soundfile as sf
+import sherpa_onnx
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
+import uvicorn
+
+
+# ============================================================
+# 1. 服务配置
+# ============================================================
+
+# HTTP / 任务调度线程池大小
+#
+# 注意：
+# 这里不再为每个线程创建一个 TTS 模型。
+# executor worker 只是负责调度任务。
+#MAX_CONCURRENT_WORKERS = 10
+
+# ONNX Runtime 每一个 TTS 模型实例使用多少线程
+#ONNX_NUM_THREADS = 4
+
+
+MAX_CONCURRENT_WORKERS = int(
+    os.getenv("MAX_CONCURRENT_WORKERS", "10")
+)
+
+ONNX_NUM_THREADS = int(
+    os.getenv("ONNX_NUM_THREADS", "4")
+)
+
+# ============================================================
+# 关键参数：每个音色创建多少个 OfflineTts 实例
+#
+# 例如：
+# MODEL_POOL_SIZE = 1
+#   male   = 1个模型实例
+#   female = 1个模型实例
+#
+# MODEL_POOL_SIZE = 2
+#   male   = 2个模型实例
+#   female = 2个模型实例
+#
+# 如果设置为 2，总模型实例数 = 4。
+#
+# 强烈建议先测试：
+#   1
+#   2
+#   4
+#
+# 不建议一上来设置很大。
+# ============================================================
+
+MODEL_POOL_SIZE = 10
+
+
+# ============================================================
+# 2. 模型配置
+# ============================================================
+
+ #VOICE_MODELS = {
+ #    "male": {
+ #        "dir": "./vits-piper-zh_CN-chaowen-medium",
+ #        "onnx_name": "zh_CN-chaowen-medium.onnx",
+ #    },
+ #
+ #    "female": {
+ #        "dir": "./vits-piper-zh_CN-xiao_ya-medium",
+ #        "onnx_name": "zh_CN-xiao_ya-medium.onnx",
+ #
+ #        # INT8版本示例
+ #        # "dir": "./vits-piper-zh_CN-xiao_ya-medium-int8",
+ #        # "onnx_name": "zh_CN-xiao_ya-medium.onnx",
+ #    },
+ #}
+MODEL_ROOT = "/models"
+
+VOICE_MODELS = {
+    "male": {
+        "dir": f"{MODEL_ROOT}/vits-piper-zh_CN-chaowen-medium",
+        "onnx_name": "zh_CN-chaowen-medium.onnx",
+    },
+
+    "female": {
+        "dir": f"{MODEL_ROOT}/vits-piper-zh_CN-xiao_ya-medium",
+        "onnx_name": "zh_CN-xiao_ya-medium.onnx",
+    },
+}
+
+
+DEFAULT_VOICE = "female"
+
+# Piper 默认采样率
+DEFAULT_SAMPLE_RATE = 22050
+
+
+# ============================================================
+# 3. 模型实例封装
+# ============================================================
+
+class TTSEngineInstance:
+    """
+    一个独立的 sherpa_onnx OfflineTts 实例。
+
+    设计原则：
+    1. 每个实例只创建一次
+    2. 同一个实例同一时间只允许一个线程调用
+    3. 不同实例之间可以并发推理
+
+    这样既保证线程安全，又能真正利用多核 CPU。
+    """
+
+    def __init__(
+        self,
+        voice_id: str,
+        model_dir: str,
+        onnx_name: str,
+        num_threads: int,
+        instance_id: int,
+    ):
+        self.voice_id = voice_id
+        self.instance_id = instance_id
+        self.lock = threading.Lock()
+
+        model_path = f"{model_dir}/{onnx_name}"
+        tokens_path = f"{model_dir}/tokens.txt"
+        lexicon_path = f"{model_dir}/lexicon.txt"
+
+        self.model_path = model_path
+
+        print(
+            f"[Model Init] "
+            f"voice={voice_id} "
+            f"instance={instance_id} "
+            f"model={model_path}"
+        )
+
+        tts_config = sherpa_onnx.OfflineTtsConfig(
+            model=sherpa_onnx.OfflineTtsModelConfig(
+                vits=sherpa_onnx.OfflineTtsVitsModelConfig(
+                    model=model_path,
+                    tokens=tokens_path,
+                    lexicon=lexicon_path,
+                ),
+                num_threads=num_threads,
+                debug=False,
+            ),
+            rule_fsts=(
+                f"{model_dir}/phone.fst,"
+                f"{model_dir}/date.fst,"
+                f"{model_dir}/number.fst"
+            ),
+        )
+
+        if not tts_config.validate():
+            raise ValueError(
+                f"TTS Config validation failed: "
+                f"voice={voice_id}, instance={instance_id}"
+            )
+
+        self.engine = sherpa_onnx.OfflineTts(tts_config)
+
+        print(
+            f"[Model Init Done] "
+            f"voice={voice_id} "
+            f"instance={instance_id}"
+        )
+
+    def generate(
+        self,
+        text: str,
+        sid: int,
+        speed: float,
+    ):
+        """
+        安全地执行一次 TTS。
+
+        当前实例通过 lock 保证：
+            一个 OfflineTts 实例 = 同时只能处理一个 generate。
+
+        不同实例可以并发执行。
+        """
+
+        with self.lock:
+            return self.engine.generate(
+                text,
+                sid=sid,
+                speed=speed,
+            )
+
+
+# ============================================================
+# 4. 模型池
+# ============================================================
+
+class TTSModelPool:
+    """
+    每个 voice 一个模型池。
+
+    例如 MODEL_POOL_SIZE=2：
+
+        female:
+            instance 0
+            instance 1
+
+        male:
+            instance 0
+            instance 1
+
+    总共 4 个 OfflineTts 实例。
+
+    使用 round-robin + condition 的方式获取空闲实例。
+    """
+
+    def __init__(
+        self,
+        voice_id: str,
+        config: dict,
+        pool_size: int,
+        num_threads: int,
+    ):
+        if pool_size < 1:
+            raise ValueError("pool_size must be >= 1")
+
+        self.voice_id = voice_id
+        self.pool_size = pool_size
+        self.num_threads = num_threads
+
+        self.instances: List[TTSEngineInstance] = []
+        self._available: List[int] = list(range(pool_size))
+
+        self._condition = threading.Condition()
+        self._next_rr = 0
+
+        model_dir = config["dir"]
+        onnx_name = config["onnx_name"]
+
+        print(
+            f"[Pool Init] "
+            f"voice={voice_id} "
+            f"pool_size={pool_size} "
+            f"onnx_threads={num_threads}"
+        )
+
+        for instance_id in range(pool_size):
+            instance = TTSEngineInstance(
+                voice_id=voice_id,
+                model_dir=model_dir,
+                onnx_name=onnx_name,
+                num_threads=num_threads,
+                instance_id=instance_id,
+            )
+
+            self.instances.append(instance)
+
+        print(
+            f"[Pool Init Done] "
+            f"voice={voice_id} "
+            f"instances={len(self.instances)}"
+        )
+
+    def acquire(self) -> TTSEngineInstance:
+        """
+        获取一个空闲模型实例。
+
+        如果所有实例都忙，则阻塞等待。
+        """
+
+        with self._condition:
+            while not self._available:
+                self._condition.wait()
+
+            # round-robin 选择
+            available_count = len(self._available)
+
+            if available_count == 1:
+                idx = 0
+            else:
+                idx = self._next_rr % available_count
+                self._next_rr += 1
+
+            instance_id = self._available.pop(idx)
+
+            return self.instances[instance_id]
+
+    def release(self, instance: TTSEngineInstance):
+        """
+        释放模型实例。
+        """
+
+        with self._condition:
+            self._available.append(instance.instance_id)
+            self._condition.notify()
+
+    def generate(
+        self,
+        text: str,
+        sid: int,
+        speed: float,
+    ):
+        """
+        获取实例 -> 推理 -> 释放实例
+        """
+
+        instance = self.acquire()
+
+        try:
+            return instance.generate(
+                text=text,
+                sid=sid,
+                speed=speed,
+            )
+        finally:
+            self.release(instance)
+
+    def size(self) -> int:
+        return len(self.instances)
+
+
+# ============================================================
+# 5. 全局模型池
+# ============================================================
+
+MODEL_POOLS: Dict[str, TTSModelPool] = {}
+
+
+def init_model_pools():
+    """
+    服务启动时只调用一次。
+
+    不再使用：
+        threading.local()
+        initializer=init_worker
+
+    因此模型不再跟 ThreadPoolExecutor worker 绑定。
+    """
+
+    MODEL_POOLS.clear()
+
+    print("=" * 70)
+    print("[Model Pools] Start loading...")
+    print(f"[Model Pools] pool_size={MODEL_POOL_SIZE}")
+    print(f"[Model Pools] onnx_threads={ONNX_NUM_THREADS}")
+    print("=" * 70)
+
+    for voice_id, config in VOICE_MODELS.items():
+
+        pool = TTSModelPool(
+            voice_id=voice_id,
+            config=config,
+            pool_size=MODEL_POOL_SIZE,
+            num_threads=ONNX_NUM_THREADS,
+        )
+
+        MODEL_POOLS[voice_id] = pool
+
+    total_instances = sum(
+        pool.size()
+        for pool in MODEL_POOLS.values()
+    )
+
+    print("=" * 70)
+    print(
+        f"[Model Pools] Loaded successfully. "
+        f"voices={len(MODEL_POOLS)}, "
+        f"total_instances={total_instances}"
+    )
+    print("=" * 70)
+
+
+# ============================================================
+# 6. HTTP 任务线程池
+# ============================================================
+
+executor: Optional[ThreadPoolExecutor] = None
+
+
+# ============================================================
+# 7. API 数据模型
+# ============================================================
+
+class TTSRequest(BaseModel):
+    text: str = Field(
+        ...,
+        description="需要合成的目标文本",
+    )
+
+    voice: str = Field(
+        default=DEFAULT_VOICE,
+        description="音色选择：male / female",
+    )
+
+    sid: int = Field(
+        default=0,
+        description="说话人 ID",
+    )
+
+    speed: float = Field(
+        default=1.0,
+        description="语速调节系数",
+    )
+
+
+# ============================================================
+# 8. FastAPI 生命周期
+# ============================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    global executor
+
+    print("=" * 70)
+    print("Starting TTS service...")
+    print(f"MAX_CONCURRENT_WORKERS = {MAX_CONCURRENT_WORKERS}")
+    print(f"ONNX_NUM_THREADS        = {ONNX_NUM_THREADS}")
+    print(f"MODEL_POOL_SIZE         = {MODEL_POOL_SIZE}")
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # 8.1 初始化模型池
+    # --------------------------------------------------------
+
+    init_model_pools()
+
+    # --------------------------------------------------------
+    # 8.2 初始化线程池
+    #
+    # 注意：
+    # initializer 已经彻底取消。
+    # 线程池不再加载模型。
+    # --------------------------------------------------------
+
+    executor = ThreadPoolExecutor(
+        max_workers=MAX_CONCURRENT_WORKERS,
+        thread_name_prefix="tts-worker",
+    )
+
+    # --------------------------------------------------------
+    # 8.3 模型预热
+    # --------------------------------------------------------
+
+    print("[Warmup] Start...")
+
+    warmup_text = "引擎预热。"
+
+    loop = asyncio.get_running_loop()
+
+    warmup_tasks = []
+
+    warmup_count_per_voice = MODEL_POOL_SIZE
+
+    for voice_id in VOICE_MODELS.keys():
+
+        for _ in range(warmup_count_per_voice):
+
+            warmup_tasks.append(
+                loop.run_in_executor(
+                    executor,
+                    _generate_chunk_sync,
+                    warmup_text,
+                    voice_id,
+                    0,
+                    1.0,
+                )
+            )
+
+    warmup_start = time.perf_counter()
+
+    await asyncio.gather(*warmup_tasks)
+
+    warmup_elapsed = time.perf_counter() - warmup_start
+
+    print(
+        f"[Warmup] Done. "
+        f"elapsed={warmup_elapsed:.3f}s"
+    )
+
+    print("=" * 70)
+    print("TTS service ready.")
+    print("=" * 70)
+
+    yield
+
+    # --------------------------------------------------------
+    # 8.4 关闭线程池
+    # --------------------------------------------------------
+
+    print("[Shutdown] Stopping executor...")
+
+    if executor is not None:
+        executor.shutdown(wait=True)
+
+    print("[Shutdown] Done.")
+
+
+app = FastAPI(
+    title="VITS TTS Multi-Voice API",
+    lifespan=lifespan,
+)
+
+
+# ============================================================
+# 9. 文本切分
+# ============================================================
+
+def split_text_by_punctuation(text: str) -> list:
+    """
+    按中英文标点切分。
+
+    这里保留你原来的策略，因为你已经实测验证：
+
+        原策略 → RTF ≈ 0.0114
+
+    所以暂时不改变。
+    """
+
+    pattern = r'([，。！？；,\.\!\?;]+)'
+
+    chunks = re.split(pattern, text)
+
+    sentences = []
+
+    i = 0
+
+    while i < len(chunks) - 1:
+
+        sentence = (
+            chunks[i].strip()
+            + chunks[i + 1].strip()
+        )
+
+        if sentence:
+            sentences.append(sentence)
+
+        i += 2
+
+    # 处理末尾无标点文本
+    if i < len(chunks):
+
+        tail = chunks[i].strip()
+
+        if tail:
+            sentences.append(tail)
+
+    return sentences
+
+
+# ============================================================
+# 10. 单个 TTS chunk 推理
+# ============================================================
+
+def _generate_chunk_sync(
+    text: str,
+    voice: str,
+    sid: int,
+    speed: float,
+):
+    """
+    在线程池中执行一条 TTS 推理。
+
+    不再通过 thread_local 获取模型。
+
+    而是：
+        voice
+          ↓
+        MODEL_POOLS
+          ↓
+        获取空闲 OfflineTts 实例
+          ↓
+        generate()
+          ↓
+        归还实例
+    """
+
+    if voice not in MODEL_POOLS:
+        raise ValueError(
+            f"Voice '{voice}' is not loaded."
+        )
+
+    pool = MODEL_POOLS[voice]
+
+    audio = pool.generate(
+        text=text,
+        sid=sid,
+        speed=speed,
+    )
+
+    if len(audio.samples) == 0:
+        return None, 0
+
+    samples = np.asarray(
+        audio.samples,
+        dtype=np.float32,
+    )
+
+    return samples, audio.sample_rate
+
+
+# ============================================================
+# 11. 完整文件合成接口
+# ============================================================
+
+@app.post("/api/tts")
+async def generate_tts(request: TTSRequest):
+
+    # --------------------------------------------------------
+    # 参数校验
+    # --------------------------------------------------------
+
+    if request.voice not in MODEL_POOLS:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid voice. "
+                f"Supported: {list(MODEL_POOLS.keys())}"
+            ),
+        )
+
+    if not request.text.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    if request.speed <= 0:
+
+        raise HTTPException(
+            status_code=400,
+            detail="speed must be > 0",
+        )
+
+    # --------------------------------------------------------
+    # 文本切分
+    # --------------------------------------------------------
+
+    sentences = split_text_by_punctuation(
+        request.text
+    )
+
+    if not sentences:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    # --------------------------------------------------------
+    # 开始计时
+    # --------------------------------------------------------
+
+    total_start = time.perf_counter()
+
+    loop = asyncio.get_running_loop()
+
+    # --------------------------------------------------------
+    # 提交任务
+    # --------------------------------------------------------
+
+    submit_start = time.perf_counter()
+
+    tasks = [
+        loop.run_in_executor(
+            executor,
+            _generate_chunk_sync,
+            sentence,
+            request.voice,
+            request.sid,
+            request.speed,
+        )
+        for sentence in sentences
+    ]
+
+    submit_elapsed = (
+        time.perf_counter() - submit_start
+    )
+
+    # --------------------------------------------------------
+    # 等待所有 chunk 完成
+    # --------------------------------------------------------
+
+    results = await asyncio.gather(*tasks)
+
+    inference_elapsed = (
+        time.perf_counter() - total_start
+    )
+
+    # --------------------------------------------------------
+    # 合并音频
+    # --------------------------------------------------------
+
+    concat_start = time.perf_counter()
+
+    all_samples = []
+
+    out_sample_rate = DEFAULT_SAMPLE_RATE
+
+    for samples, sample_rate in results:
+
+        if samples is not None:
+
+            all_samples.append(samples)
+            out_sample_rate = sample_rate
+
+    if not all_samples:
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate any audio.",
+        )
+
+    if len(all_samples) == 1:
+
+        final_audio = all_samples[0]
+
+    else:
+
+        final_audio = np.concatenate(
+            all_samples
+        )
+
+    concat_elapsed = (
+        time.perf_counter() - concat_start
+    )
+
+    # --------------------------------------------------------
+    # 性能统计
+    # --------------------------------------------------------
+
+    total_elapsed = (
+        time.perf_counter()
+        - total_start
+    )
+
+    duration = (
+        len(final_audio)
+        / out_sample_rate
+    )
+
+    rtf = (
+        total_elapsed / duration
+        if duration > 0
+        else 0
+    )
+
+    realtime_speed = (
+        duration / total_elapsed
+        if total_elapsed > 0
+        else 0
+    )
+
+    print(
+        "\n"
+        "[Complete TTS]\n"
+        f"  Voice            : {request.voice}\n"
+        f"  Chunks           : {len(sentences)}\n"
+        f"  Characters       : {len(request.text)}\n"
+        f"  Audio duration   : {duration:.3f}s\n"
+        f"  Total elapsed    : {total_elapsed:.3f}s\n"
+        f"  Inference elapsed: {inference_elapsed:.3f}s\n"
+        f"  Submit elapsed   : {submit_elapsed:.6f}s\n"
+        f"  Concat elapsed   : {concat_elapsed:.6f}s\n"
+        f"  RTF              : {rtf:.4f}\n"
+        f"  Realtime speed   : {realtime_speed:.2f}x\n"
+    )
+
+    # --------------------------------------------------------
+    # WAV编码
+    # --------------------------------------------------------
+
+    wav_start = time.perf_counter()
+
+    buffer = io.BytesIO()
+
+    sf.write(
+        buffer,
+        final_audio,
+        samplerate=out_sample_rate,
+        subtype="PCM_16",
+        format="WAV",
+    )
+
+    buffer.seek(0)
+
+    wav_elapsed = (
+        time.perf_counter() - wav_start
+    )
+
+    print(
+        f"[WAV] encode={wav_elapsed:.6f}s"
+    )
+
+    return Response(
+        content=buffer.getvalue(),
+        media_type="audio/wav",
+    )
+
+
+# ============================================================
+# 12. SSE 流式接口
+# ============================================================
+
+@app.post("/api/tts_sse")
+async def generate_tts_sse(
+    request: TTSRequest
+):
+
+    if request.voice not in MODEL_POOLS:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid voice. "
+                f"Supported: {list(MODEL_POOLS.keys())}"
+            ),
+        )
+
+    if not request.text.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    if request.speed <= 0:
+
+        raise HTTPException(
+            status_code=400,
+            detail="speed must be > 0",
+        )
+
+    sentences = split_text_by_punctuation(
+        request.text
+    )
+
+    if not sentences:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    async def sse_generator():
+
+        loop = asyncio.get_running_loop()
+
+        total_start = time.perf_counter()
+
+        for i, sentence in enumerate(sentences):
+
+            chunk_start = time.perf_counter()
+
+            samples, sample_rate = (
+                await loop.run_in_executor(
+                    executor,
+                    _generate_chunk_sync,
+                    sentence,
+                    request.voice,
+                    request.sid,
+                    request.speed,
+                )
+            )
+
+            chunk_elapsed = (
+                time.perf_counter()
+                - chunk_start
+            )
+
+            if samples is None or len(samples) == 0:
+                continue
+
+            # ------------------------------------------------
+            # WAV编码
+            # ------------------------------------------------
+
+            wav_buffer = io.BytesIO()
+
+            sf.write(
+                wav_buffer,
+                samples,
+                samplerate=sample_rate,
+                subtype="PCM_16",
+                format="WAV",
+            )
+
+            wav_buffer.seek(0)
+
+            wav_base64 = base64.b64encode(
+                wav_buffer.getvalue()
+            ).decode("utf-8")
+
+            chunk_duration = (
+                len(samples)
+                / sample_rate
+            )
+
+            chunk_rtf = (
+                chunk_elapsed / chunk_duration
+                if chunk_duration > 0
+                else 0
+            )
+
+            print(
+                f"[SSE Chunk {i}] "
+                f"voice={request.voice} "
+                f"text='{sentence[:20]}...' "
+                f"audio={chunk_duration:.3f}s "
+                f"elapsed={chunk_elapsed:.3f}s "
+                f"rtf={chunk_rtf:.4f}"
+            )
+
+            payload = {
+
+                "chunk_index": i,
+
+                "text": sentence,
+
+                "voice_used": request.voice,
+
+                "audio_base64": wav_base64,
+
+                "audio_duration": chunk_duration,
+
+                "rtf": chunk_rtf,
+
+                "is_final": (
+                    i == len(sentences) - 1
+                ),
+            }
+
+            yield (
+                "data: "
+                + json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
+
+        total_elapsed = (
+            time.perf_counter()
+            - total_start
+        )
+
+        print(
+            f"[SSE Complete] "
+            f"voice={request.voice} "
+            f"chunks={len(sentences)} "
+            f"elapsed={total_elapsed:.3f}s"
+        )
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ============================================================
+# 13. 健康检查接口
+# ============================================================
+
+@app.get("/health")
+async def health_check():
+
+    pool_info = {}
+
+    for voice_id, pool in MODEL_POOLS.items():
+
+        pool_info[voice_id] = {
+            "pool_size": pool.size(),
+        }
+
+    return {
+        "status": "ok",
+
+        "config": {
+            "max_workers": MAX_CONCURRENT_WORKERS,
+            "onnx_num_threads": ONNX_NUM_THREADS,
+            "model_pool_size": MODEL_POOL_SIZE,
+        },
+
+        "voices": pool_info,
+    }
+
+
+# ============================================================
+# 14. 启动
+# ============================================================
+
+if __name__ == "__main__":
+
+    uvicorn.run(
+        "vits_tts_server:app",
+        host="0.0.0.0",
+        port=8000,
+        workers=1,
+        log_level="info",
+    )
