@@ -1,0 +1,39 @@
+# ============ 模型权重 / 大模型文件（体积大，按 README「模型权重」自行下载或本地生成）============
+model_weight/**
+!model_weight/.gitkeep
+fast-kokoro/weights/
+*.onnx
+*.pth
+*.pt
+
+# ============ 镜像导出包 ============
+*.tar
+*.tar.bz2
+*.tar.gz
+
+# ============ 运行产物 ============
+logs/**
+!logs/.gitkeep
+*.wav
+*.mp3
+*.log
+**/temp_files/
+**/bench/out*/
+fast-kokoro/out/
+fast-kokoro/logs/
+
+# ============ Python ============
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ============ 编辑器 / 系统 ============
+.idea/
+.vscode/
+.DS_Store
+
+# ============ 密钥与本地配置 ============
+.env
+*.local

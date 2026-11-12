@@ -16,6 +16,8 @@ import os
 import re
 from typing import List, Optional, Tuple
 
+from power_normalizer import normalize_power_text, sanitize_text
+
 # 语种片段短于该值时并入相邻片段，避免 "GPU"/"F5"/"AC" 这类短词来回切音色
 AUTO_MIN_SPAN_CHARS = int(os.getenv("AUTO_MIN_SPAN_CHARS", "4"))
 # 领域规范化总开关（供 /health 展示）
@@ -287,63 +289,23 @@ def normalize_domain_text(text: str) -> str:
     if not text or os.getenv("DOMAIN_NORMALIZE", "true").lower() in ("0", "false", "no"):
         return text
 
-    out = text
-    for entity, repl in _HTML_ENTITIES:
-        out = out.replace(entity, repl)
-    out = re.sub(r"&#x?[0-9A-Fa-f]+;?", " ", out)  # 其余实体兜底当空格
-    out = out.replace("\u200b", "").replace("\ufeff", "")
-    # 全角数字/字母 -> 半角
-    out = "".join(
-        chr(ord(c) - 0xFEE0)
-        if 0xFF10 <= ord(c) <= 0xFF19 or 0xFF21 <= ord(c) <= 0xFF3A or 0xFF41 <= ord(c) <= 0xFF5A
-        else c
-        for c in out
-    )
-    # 全角罗马数字先转半角，再统一按罗马数字处理（比原来的「只处理 X段」更完整）
-    for fw, ascii_roman in _FULLWIDTH_ROMAN.items():
-        out = out.replace(fw, ascii_roman)
-    out = _ROMAN_TOKEN_RE.sub(_roman_sub, out)
+    cleaned = sanitize_text(text)
+    acronym_style = "chinese" if LETTER_NAMES_ZH else "english"
 
-    # 符号 -> 中文读法（仅中文语境；先把符号换成占位符再判断上下文，避免符号本身干扰）
-    def _sym_sub(match: "re.Match", repl: str) -> str:
-        return repl if _zh_context(out, match.start(), match.end()) else match.group(0)
-
-    import re as _re
-
-    for sym, cn in _SYMBOL_PREFIX:  # 30% -> 百分之30
-        out = _re.sub(
-            rf"(\d+(?:\.\d+)?)\s*{_re.escape(sym)}",
-            lambda m: (cn + m.group(1)) if _zh_context(out, m.start(), m.end()) else m.group(0),
-            out,
-        )
-    for sym, cn in _SYMBOL_SUFFIX:  # #2 -> 2号
-        out = _re.sub(
-            rf"{_re.escape(sym)}\s*(\d+)",
-            lambda m: (m.group(1) + cn) if _zh_context(out, m.start(), m.end()) else m.group(0),
-            out,
-        )
-    for sym, cn in _SYMBOL_MAP:
-        out = _re.sub(_re.escape(sym), lambda m: _sym_sub(m, cn), out)
-
-    # 先处理单位（需要"数字后紧跟单位"的位置关系），再把小数转成中文读法
-    for pattern, repl in _UNIT_RULES:
-        # skip_alnum：像 AC380V 这种前缀字母不影响"是否中文语境"的判断
-        out = _sub_zh_context_skip_alnum(pattern, repl, out)
-    out = _sub_zh_context_skip_alnum(_DECIMAL_RE, _decimal_sub, out)
-
-    # 字母与数字相邻时拆开：11F5 -> 11 F 5（数字由中文音色读，字母由英文音色读；
-    # 否则 "F5" 会整段交给英文音色读成 "F five"）
-    out = _ALNUM_TOKEN_RE.sub(_split_alnum_token, out)
-    # 长设备号逐位读：1198号 -> 一一九八号
-    out = _DEVICE_NO_RE.sub(_device_no_sub, out)
-
-    # 大写字母/缩写 -> 中文近似读法（AC -> 诶西，GPU -> 记皮优）
-    # 这样电力场景里的相别、设备缩写都由中文音色读，不会出现音色跳动；
-    # 含小写字母的英文单词/句子不受影响，仍走英文音色。
-    out = _UPPER_RUN_RE.sub(_upper_run_to_chinese, out)
-    out = re.sub(r"[ \t\r\f\v]+", " ", out)
-    out = re.sub(r"\s*\n\s*", " ", out)
-    return out.strip()
+    # 按句保留中文、英文和纯数字/符号三类语境。含中文的句子走完整规则；
+    # 纯英文句子只做全角字符与 HTML 实体清理，避免英文数字被读成中文。
+    pieces = re.split(r"(?<=[。！？!?；;\n])", cleaned)
+    out = []
+    for piece in pieces:
+        if not piece:
+            continue
+        has_cjk = bool(_CJK.search(piece))
+        has_lowercase_latin = bool(re.search(r"[a-z]", piece))
+        if has_cjk or not has_lowercase_latin:
+            out.append(normalize_power_text(piece, acronym_style=acronym_style))
+        else:
+            out.append(piece)
+    return "".join(out).strip()
 
 
 # --------------------------------------------------------------------------
