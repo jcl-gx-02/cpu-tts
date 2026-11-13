@@ -1094,6 +1094,17 @@ def _normalize_comparators(text: str) -> str:
     )
 
 
+_PAIRED_ANGLE_LABEL_RE = re.compile(
+    r"<\s*([^<>\r\n，。；：,;]*?[\u4e00-\u9fff]"
+    r"[^<>\r\n，。；：,;]*?)\s*>"
+)
+
+
+def _normalize_paired_angle_labels(text: str) -> str:
+    """Remove angle brackets around Chinese labels; keep real comparisons."""
+    return _PAIRED_ANGLE_LABEL_RE.sub(lambda match: match.group(1).strip(), text)
+
+
 _COMMON_SYMBOL_MAP = [
     ("≈", "约等于"),
     ("≠", "不等于"),
@@ -1335,6 +1346,7 @@ def normalize_power_text(
     text = _normalize_times_sign(text)
     text = _normalize_mixed_alnum_tokens(text, acronym_style)
     text = _normalize_acronyms(text, acronym_style)
+    text = _normalize_paired_angle_labels(text)
     text = _normalize_comparators(text)
     text = _normalize_common_symbols(text)
     text = (
